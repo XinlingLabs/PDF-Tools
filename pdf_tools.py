@@ -848,7 +848,7 @@ usage_hint = tk.Label(
 
 usage_hint.pack(anchor="w", padx=14, pady=(0, 10))
 
-open_url = "https://github.com/XinlingLabs/PDFTools"
+open_url = "https://github.com/XinlingLabs/PDF-Tools"
 
 usage_hint.bind(
     "<Button-1>",
