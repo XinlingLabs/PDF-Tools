@@ -1,5 +1,6 @@
 import csv
 import os
+import shutil
 import sys
 import threading
 import time
@@ -24,9 +25,9 @@ except Exception:
 
 root.title("PDF Tools")
 root.geometry("1100x900")
-root.minsize(1000, 760)
+root.minsize(1100, 900)
 root.configure(bg="#eef2f7")
-VERSION = "v3.1.1"
+VERSION = "v3.1.11"
 
 
 def ui(func):
@@ -79,24 +80,24 @@ style.map("Horizontal.TScrollbar", background=[("active", "#444")])
 
 style.configure(
     "green.Horizontal.TProgressbar",
-    troughcolor="#e6e6e6",
-    background="#2ecc71",
-    lightcolor="#2ecc71",
-    darkcolor="#2ecc71",
+    troughcolor="#e8edf3",
+    background="#45b36b",
+    lightcolor="#45b36b",
+    darkcolor="#45b36b",
 )
 style.configure(
     "blue.Horizontal.TProgressbar",
-    troughcolor="#e6e6e6",
-    background="#3498db",
-    lightcolor="#3498db",
-    darkcolor="#3498db",
+    troughcolor="#e8edf3",
+    background="#4f8edb",
+    lightcolor="#4f8edb",
+    darkcolor="#4f8edb",
 )
 style.configure(
     "red.Horizontal.TProgressbar",
-    troughcolor="#e6e6e6",
-    background="#e74c3c",
-    lightcolor="#e74c3c",
-    darkcolor="#e74c3c",
+    troughcolor="#e8edf3",
+    background="#d95f59",
+    lightcolor="#d95f59",
+    darkcolor="#d95f59",
 )
 
 
@@ -264,6 +265,159 @@ def parse_input(text):
     return out
 
 
+def compose_names(name_inputs):
+    first_text, second_text = name_inputs
+    first_names = parse_input(first_text)
+    second_names = parse_input(second_text)
+
+    if not second_names:
+        return first_names, None
+
+    if len(first_names) < len(second_names) or len(first_names) - len(second_names) > 1:
+        return [], "第二组有数据时，两组数量必须按左、右交替匹配"
+
+    names = []
+    for index, first_name in enumerate(first_names):
+        names.append(first_name)
+        if index < len(second_names):
+            names.append(second_names[index])
+    return names, None
+
+
+def validate_names(names, expected_count, error=None):
+    if error:
+        log(f"[ERROR]{error}", "error")
+        set_progress(
+            style_name="red.Horizontal.TProgressbar",
+            mode="determinate",
+            value=0,
+            text="失败",
+            stop=True,
+            force=True,
+        )
+        return False
+
+    if len(names) != expected_count:
+        log("[ERROR]名称数量不一致", "error")
+        set_progress(
+            style_name="red.Horizontal.TProgressbar",
+            mode="determinate",
+            value=0,
+            text="失败",
+            stop=True,
+            force=True,
+        )
+        return False
+
+    if len(names) != len(set(names)):
+        log("[ERROR]存在重复名称", "error")
+        set_progress(
+            style_name="red.Horizontal.TProgressbar",
+            mode="determinate",
+            value=0,
+            text="失败",
+            stop=True,
+            force=True,
+        )
+        return False
+
+    return True
+
+
+def clear_folder_contents(folder):
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+
+
+def output_dir_has_contents(outdir):
+    if not outdir or not os.path.isdir(outdir) or not os.listdir(outdir):
+        return False
+
+    folder_path = os.path.abspath(outdir)
+    cwd_path = os.path.abspath(os.getcwd())
+    if folder_path == cwd_path:
+        log("[WARN]输出路径为当前程序目录，已跳过清空提示", "warn")
+        return False
+
+    return True
+
+
+def ask_clear_output_dir(outdir):
+    def ask():
+        return messagebox.askyesnocancel(
+            "输出文件夹不为空",
+            "输出文件夹不为空，是否清空后继续？\n\n"
+            "选择“是”：清空文件夹后继续。\n"
+            "选择“否”：不清空，直接继续。\n"
+            "选择“取消”：停止本次处理。",
+        )
+
+    if threading.current_thread() is threading.main_thread():
+        return ask()
+
+    result = {"answer": False}
+    done = threading.Event()
+
+    def run_ask():
+        try:
+            result["answer"] = ask()
+        finally:
+            done.set()
+
+    ui(run_ask)
+    done.wait()
+    return result["answer"]
+
+
+def prepare_output_dir(outdir):
+    if not output_dir_has_contents(outdir):
+        return True
+
+    answer = ask_clear_output_dir(outdir)
+    if answer is None:
+        log("[INFO]用户取消操作，本次处理已停止")
+        set_progress(
+            style_name="red.Horizontal.TProgressbar",
+            mode="determinate",
+            value=0,
+            text="已取消",
+            stop=True,
+            force=True,
+        )
+        return False
+    if not answer:
+        log("[INFO]未清空输出文件夹，继续处理")
+        return True
+
+    try:
+        clear_folder_contents(outdir)
+        log(f"[INFO]已清空输出文件夹:{outdir}")
+        return True
+    except Exception as exc:
+        messagebox.showerror("清空失败", f"无法清空输出文件夹：\n{exc}")
+        log(f"[ERROR]清空输出文件夹失败:{exc}", "error")
+        return False
+
+
+def unique_output_path(outdir, file_name):
+    base, ext = os.path.splitext(file_name)
+    path = os.path.join(outdir, file_name)
+    if not os.path.exists(path):
+        return path, file_name
+
+    index = 1
+    while True:
+        candidate_name = f"{base}_{index}{ext}"
+        candidate_path = os.path.join(outdir, candidate_name)
+        if not os.path.exists(candidate_path):
+            return candidate_path, candidate_name
+        index += 1
+
+
 def build_splits(rule, total):
     if not rule:
         raise ValueError("拆分规则不能为空")
@@ -332,6 +486,35 @@ def styled_text(parent, h=6):
     )
     text.pack(fill="both", padx=14, pady=(6, 12))
     return text
+
+
+def styled_name_texts(parent, h=5):
+    frame = tk.Frame(parent, bg=CARD)
+    frame.pack(fill="both", padx=14, pady=(6, 12))
+    frame.columnconfigure(0, weight=1, uniform="names")
+    frame.columnconfigure(1, weight=1, uniform="names")
+
+    left_text = tk.Text(
+        frame,
+        height=h,
+        font=("Consolas", 10),
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground="#c0c4cc",
+        highlightcolor=PRIMARY,
+    )
+    right_text = tk.Text(
+        frame,
+        height=h,
+        font=("Consolas", 10),
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground="#c0c4cc",
+        highlightcolor=PRIMARY,
+    )
+    left_text.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+    right_text.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+    return left_text, right_text
 
 
 def action_button(parent, text, command):
@@ -441,15 +624,16 @@ def drop(event):
 
 
 # ====== 主逻辑 ======
-def process_worker(path, outdir, rule, name_input, selected_files, save_csv):
+def process_worker(path, outdir, rule, name_inputs, selected_files, save_csv):
     start_time = time.time()
     try:
         log_block("开始处理")
         set_progress(
             style_name="blue.Horizontal.TProgressbar",
-            mode="indeterminate",
+            mode="determinate",
+            value=0,
             text="处理中...",
-            start=True,
+            stop=True,
             force=True,
         )
 
@@ -459,16 +643,17 @@ def process_worker(path, outdir, rule, name_input, selected_files, save_csv):
                 style_name="red.Horizontal.TProgressbar",
                 mode="determinate",
                 value=0,
+                text="失败",
                 stop=True,
                 force=True,
             )
             return
 
         if len(selected_files) > 1:
-            rename_multi_files(selected_files, name_input)
+            rename_multi_files(selected_files, name_inputs)
             return
 
-        split_pdf(path, outdir, rule, name_input, save_csv, start_time)
+        split_pdf(path, outdir, rule, name_inputs, save_csv, start_time)
     except Exception:
         err = traceback.format_exc()
         log("[ERROR]处理失败\n" + err, "error")
@@ -484,60 +669,49 @@ def process_worker(path, outdir, rule, name_input, selected_files, save_csv):
         reset_processing()
 
 
-def rename_multi_files(selected_files, name_input):
+def rename_multi_files(selected_files, name_inputs):
     log_block("多文件重命名")
-    names = parse_input(name_input)
+    names, name_error = compose_names(name_inputs)
 
-    if len(names) != len(selected_files):
-        log("[ERROR]名称数量不一致", "error")
-        set_progress(
-            style_name="red.Horizontal.TProgressbar",
-            mode="determinate",
-            value=0,
-            text="失败",
-            stop=True,
-            force=True,
-        )
+    if not validate_names(names, len(selected_files), name_error):
         return
 
-    if len(names) != len(set(names)):
-        log("[ERROR]存在重复名称", "error")
-        set_progress(
-            style_name="red.Horizontal.TProgressbar",
-            mode="determinate",
-            value=0,
-            text="失败",
-            stop=True,
-            force=True,
-        )
-        return
-
-    for old_path, new_name in zip(selected_files, names):
+    has_error = False
+    total_files = len(selected_files)
+    for index, (old_path, new_name) in enumerate(zip(selected_files, names), start=1):
         ext = os.path.splitext(old_path)[1]
         new_path = os.path.join(os.path.dirname(old_path), f"{new_name}{ext}")
 
         if os.path.exists(new_path):
             log(f"[WARN]已存在:{new_path}", "warn")
-            continue
+            has_error = True
+        else:
+            try:
+                os.rename(old_path, new_path)
+                log(f"[OK]{old_path}->{new_path}", "ok")
+            except Exception as exc:
+                log(f"[ERROR]重命名失败:{old_path} {exc}", "error")
+                has_error = True
 
-        try:
-            os.rename(old_path, new_path)
-            log(f"[OK]{old_path}->{new_path}", "ok")
-        except Exception as exc:
-            log(f"[ERROR]重命名失败:{old_path} {exc}", "error")
+        percent = (index / total_files) * 100
+        set_progress(value=percent, text=f"{percent:.1f}%")
 
     set_progress(
-        style_name="green.Horizontal.TProgressbar",
+        style_name=(
+            "red.Horizontal.TProgressbar"
+            if has_error
+            else "green.Horizontal.TProgressbar"
+        ),
         mode="determinate",
         value=100,
-        text="完成",
+        text="失败" if has_error else "完成",
         stop=True,
         force=True,
     )
     log_block("完成")
 
 
-def split_pdf(path, outdir, rule, name_input, save_csv, start_time):
+def split_pdf(path, outdir, rule, name_inputs, save_csv, start_time):
     log(f"[INFO]输入文件:{path}")
 
     if not outdir:
@@ -604,8 +778,11 @@ def split_pdf(path, outdir, rule, name_input, save_csv, start_time):
         )
         return
 
+    if not prepare_output_dir(outdir):
+        return
+
     set_progress(
-        style_name="green.Horizontal.TProgressbar",
+        style_name="blue.Horizontal.TProgressbar",
         mode="determinate",
         value=0,
         stop=True,
@@ -639,7 +816,7 @@ def split_pdf(path, outdir, rule, name_input, save_csv, start_time):
         for page_index in range(start_page, end_page):
             writer.add_page(reader.pages[page_index])
 
-        full_path = os.path.join(outdir, file_name)
+        full_path, file_name = unique_output_path(outdir, file_name)
 
         try:
             with open(full_path, "wb") as file:
@@ -689,19 +866,21 @@ def split_pdf(path, outdir, rule, name_input, save_csv, start_time):
         write_csv(outdir, check_results)
     else:
         log("[INFO]未输出CSV")
-    rename_outputs(outdir, generated_files, name_input)
+    rename_ok = rename_outputs(outdir, generated_files, name_inputs)
 
     duration = time.time() - start_time
     errors = sum(1 for item in check_results if item["结果"] != "正确")
-    if errors:
+    if errors or not rename_ok:
+        progress_text = "页数不一致" if errors else "失败"
         set_progress(
             style_name="red.Horizontal.TProgressbar",
             mode="determinate",
             value=100,
-            text="页数不一致",
+            text=progress_text,
             force=True,
         )
-        ui(lambda: messagebox.showwarning("页数不一致", f"发现 {errors} 个文件页数与手动输入不一致，请查看运行日志。"))
+        if errors:
+            ui(lambda: messagebox.showwarning("页数不一致", f"发现 {errors} 个文件页数与手动输入不一致，请查看运行日志。"))
     else:
         set_progress(
             style_name="green.Horizontal.TProgressbar",
@@ -772,28 +951,28 @@ def write_csv(outdir, result):
         log(f"[ERROR]CSV写入失败:{exc}", "error")
 
 
-def rename_outputs(outdir, output_files, name_input):
-    if not name_input:
+def rename_outputs(outdir, output_files, name_inputs):
+    names, name_error = compose_names(name_inputs)
+    if not names:
+        if name_error:
+            validate_names(names, len(output_files), name_error)
+            return False
         log("[INFO]未执行重命名")
-        return
+        return True
 
     log_block("重命名")
-    names = parse_input(name_input)
 
-    if len(names) != len(output_files):
-        log("[ERROR]名称数量不一致", "error")
-        return
+    if not validate_names(names, len(output_files), name_error):
+        return False
 
-    if len(names) != len(set(names)):
-        log("[ERROR]存在重复名称", "error")
-        return
-
+    has_error = False
     for item, new_name in zip(output_files, names):
         old_path = item["path"]
         new_path = os.path.join(outdir, f"{new_name}.pdf")
 
         if os.path.exists(new_path):
             log(f"[WARN]已存在:{new_path}", "warn")
+            has_error = True
             continue
 
         try:
@@ -801,6 +980,9 @@ def rename_outputs(outdir, output_files, name_input):
             log(f"[OK]{old_path}->{new_path}", "ok")
         except Exception as exc:
             log(f"[ERROR]重命名失败:{old_path} {exc}", "error")
+            has_error = True
+
+    return not has_error
 
 
 def start_process():
@@ -816,11 +998,18 @@ def start_process():
         pending_logs.clear()
         log_flush_scheduled = False
     text_log.delete("1.0", "end")
+    progress.stop()
+    progress.config(style="blue.Horizontal.TProgressbar", mode="determinate")
+    progress["value"] = 0
+    progress_label.config(text="处理中...")
 
     path = input_pdf.get().strip()
     outdir = output_dir.get().strip()
     rule = text_rules.get("1.0", "end").strip()
-    name_input = text_names.get("1.0", "end").strip()
+    name_inputs = (
+        text_names_left.get("1.0", "end").strip(),
+        text_names_right.get("1.0", "end").strip(),
+    )
     save_csv = output_csv.get()
     selected_files = list(multi_files)
     if selected_files and path != selected_files[0]:
@@ -828,7 +1017,7 @@ def start_process():
 
     threading.Thread(
         target=process_worker,
-        args=(path, outdir, rule, name_input, selected_files, save_csv),
+        args=(path, outdir, rule, name_inputs, selected_files, save_csv),
         daemon=True,
     ).start()
 
@@ -872,12 +1061,16 @@ usage_tooltip_text = (
     "   实际页数与期望页数不一致时会提示。\n"
     "   日志标红、进度条变红，并弹窗提醒。\n\n"
     "5. 文件命名\n"
-    "   新文件名可选，支持逐行或逗号分隔。\n"
-    "   名称数量必须与生成文件数量一致。\n"
+    "   新文件名可选，左右两组都支持逐行或逗号分隔。\n"
+    "   只填写左侧时，保持旧逻辑按左侧顺序命名。\n"
+    "   右侧第二组有内容时，按左1、右1、左2、右2交替命名。\n"
+    "   交替命名时，左侧数量需等于右侧，或只比右侧多 1 个。\n"
+    "   最终名称数量必须与需要命名的文件总数一致。\n"
     "   文件名不能重复，已存在文件不会覆盖。\n\n"
     "6. 输出设置\n"
     "   输出路径为空时，默认使用当前目录。\n"
     "   路径不存在时，程序会自动创建。\n"
+    "   输出文件夹已有内容时，可选择清空运行、不清空运行或取消操作。\n"
     "   勾选输出 CSV 后，才生成拆分结果.csv。\n\n"
     "by xinling"
 )
@@ -911,7 +1104,7 @@ c2 = card("拆分规则")
 text_rules = styled_text(c2, 5)
 
 c3 = card("新文件名")
-text_names = styled_text(c3, 5)
+text_names_left, text_names_right = styled_name_texts(c3, 5)
 
 bottom_bar = tk.Frame(left, bg="#eef2f7")
 bottom_bar.pack(side="bottom", fill="x", padx=8, pady=(GAP, 0))
