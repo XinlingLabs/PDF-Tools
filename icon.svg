@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+
+  <!-- ===================== -->
+  <!-- 左侧主体（整体放大） -->
+  <!-- ===================== -->
+  <g id="left">
+
+    <!-- PDF主体 -->
+    <rect x="140" y="170"
+          width="300"
+          height="684"
+          rx="44"
+          fill="#ffffff"/>
+
+    <!-- 内容条 -->
+    <rect x="210" y="360"
+          width="160"
+          height="48"
+          rx="24"
+          fill="#4f8edb"/>
+
+    <rect x="210" y="500"
+          width="120"
+          height="48"
+          rx="24"
+          fill="#4f8edb"/>
+
+    <rect x="210" y="640"
+          width="160"
+          height="48"
+          rx="24"
+          fill="#4f8edb"/>
+
+  </g>
+
+  <!-- ===================== -->
+  <!-- 右侧主体（镜像） -->
+  <!-- ===================== -->
+  <g transform="translate(1024,0) scale(-1,1)">
+
+    <rect x="140" y="170"
+          width="300"
+          height="684"
+          rx="44"
+          fill="#ffffff"/>
+
+    <rect x="210" y="360"
+          width="160"
+          height="48"
+          rx="24"
+          fill="#4f8edb"/>
+
+    <rect x="210" y="500"
+          width="120"
+          height="48"
+          rx="24"
+          fill="#4f8edb"/>
+
+    <rect x="210" y="640"
+          width="160"
+          height="48"
+          rx="24"
+          fill="#4f8edb"/>
+
+  </g>
+
+  <!-- ===================== -->
+  <!-- 中心分割 -->
+  <!-- ===================== -->
+  <rect x="492"
+        y="300"
+        width="40"
+        height="424"
+        rx="20"
+        fill="#4f8edb"/>
+
+  <!-- 左箭头 -->
+  <path fill="#4f8edb"
+        d="M468 512 400 456v112Z"/>
+
+  <!-- 右箭头 -->
+  <path fill="#4f8edb"
+        d="M556 512 624 456v112Z"/>
+
+</svg>
