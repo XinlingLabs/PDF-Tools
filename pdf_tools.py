@@ -1,11 +1,13 @@
 import csv
 import os
+import queue
 import shutil
 import sys
 import threading
 import time
 import traceback
 import webbrowser
+from collections import OrderedDict
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -27,7 +29,7 @@ root.title("PDF Tools")
 root.geometry("1100x900")
 root.minsize(1100, 900)
 root.configure(bg="#eef2f7")
-VERSION = "v3.1.11"
+VERSION = "v3.1.12"
 
 
 def ui(func):
@@ -36,6 +38,15 @@ def ui(func):
 
 LOG_FLUSH_MS = 40
 PROGRESS_UPDATE_INTERVAL = 0.08
+PREVIEW_THUMB_WIDTH = 150
+PREVIEW_THUMB_MAX_HEIGHT = 210
+PREVIEW_TILE_WIDTH = 172
+PREVIEW_TILE_HEIGHT = 250
+PREVIEW_TILE_X_STEP = 188
+PREVIEW_TILE_Y_STEP = 266
+PREVIEW_QUEUE_BATCH = 40
+PREVIEW_QUEUE_DELAY_MS = 15
+PREVIEW_REDRAW_DELAY_MS = 16
 log_lock = threading.Lock()
 pending_logs = []
 log_flush_scheduled = False
@@ -105,8 +116,11 @@ style.configure(
 input_pdf = tk.StringVar()
 output_dir = tk.StringVar(value=os.path.join(os.getcwd(), "output"))
 output_csv = tk.BooleanVar(value=False)
+preview_on_drop = tk.BooleanVar(value=False)
 multi_files = []
 is_processing = False
+visual_split_ranges = []
+visual_split_path = ""
 
 
 # ====== 颜色 ======
@@ -263,6 +277,37 @@ def parse_input(text):
             if value:
                 out.append(value)
     return out
+
+
+def format_page_ranges(ranges):
+    return ",".join(f"{start}-{end}" if start != end else str(start) for start, end in ranges)
+
+
+def pair_checked_pages(checked_pages):
+    ranges = []
+    pages = sorted(set(checked_pages))
+    for index in range(0, len(pages), 2):
+        start = pages[index]
+        end = pages[index + 1] if index + 1 < len(pages) else start
+        if end < start:
+            start, end = end, start
+        ranges.append((start, end))
+    return ranges
+
+
+def set_visual_split(path, ranges):
+    global visual_split_path, visual_split_ranges
+    visual_split_path = path
+    visual_split_ranges = ranges[:]
+    text_rules.delete("1.0", "end")
+    text_rules.insert("1.0", format_page_ranges(ranges))
+    log(f"[INFO]已设置预览拆分:{format_page_ranges(ranges)}")
+
+
+def clear_visual_split():
+    global visual_split_path, visual_split_ranges
+    visual_split_path = ""
+    visual_split_ranges = []
 
 
 def compose_names(name_inputs):
@@ -586,13 +631,713 @@ def hover(btn):
     btn.bind("<Leave>", lambda event: btn.config(bg=PRIMARY))
 
 
+def render_pdf_thumbnail(path, page_index, width=150, max_height=None):
+    try:
+        import fitz
+
+        with fitz.open(path) as doc:
+            page = doc.load_page(page_index)
+            scale = width / page.rect.width
+            if max_height:
+                scale = min(scale, max_height / page.rect.height)
+            matrix = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            data = pix.tobytes("ppm")
+        return tk.PhotoImage(data=data, format="PPM")
+    except Exception:
+        return None
+
+
+def render_pdf_thumbnail_data(path, page_index, width=150, max_height=None):
+    try:
+        import fitz
+
+        with fitz.open(path) as doc:
+            page = doc.load_page(page_index)
+            scale = width / page.rect.width
+            if max_height:
+                scale = min(scale, max_height / page.rect.height)
+            matrix = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            return pix.tobytes("ppm")
+    except Exception:
+        return None
+
+
+def make_placeholder_thumbnail(parent, page_num, width=150, height=210):
+    canvas = tk.Canvas(
+        parent,
+        width=width,
+        height=height,
+        bg="#f8fafc",
+        highlightthickness=1,
+        highlightbackground="#d0d5dd",
+    )
+    canvas.create_text(
+        width // 2,
+        height // 2,
+        text=f"第 {page_num} 页",
+        fill=MUTED,
+        font=("微软雅黑", 13, "bold"),
+    )
+    return canvas
+
+
+def show_page_zoom(path, page_index, page_num):
+    zoom = tk.Toplevel(root)
+    zoom.title(f"第 {page_num} 页")
+    zoom.configure(bg="#111827")
+    try:
+        zoom.state("zoomed")
+    except Exception:
+        zoom.geometry(
+            f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0"
+        )
+
+    frame = tk.Frame(zoom, bg="#111827")
+    frame.pack(fill="both", expand=True)
+    canvas = tk.Canvas(frame, bg="#111827", highlightthickness=0)
+    scroll_y = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+    scroll_x = ttk.Scrollbar(frame, orient="horizontal", command=canvas.xview)
+    canvas.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+    scroll_y.pack(side="right", fill="y")
+    scroll_x.pack(side="bottom", fill="x")
+    canvas.pack(side="left", fill="both", expand=True)
+
+    zoom_state = {"factor": 1.0, "fit_width": 900, "fit_height": 900}
+
+    def fit_size():
+        zoom.update_idletasks()
+        zoom_state["fit_width"] = max(400, canvas.winfo_width() - 40)
+        zoom_state["fit_height"] = max(400, canvas.winfo_height() - 40)
+
+    def draw_page():
+        fit_size()
+        target_width = int(zoom_state["fit_width"] * zoom_state["factor"])
+        target_height = int(zoom_state["fit_height"] * zoom_state["factor"])
+        canvas.delete("all")
+        image = render_pdf_thumbnail(
+            path,
+            page_index,
+            width=target_width,
+            max_height=target_height,
+        )
+        if image:
+            canvas_width = max(canvas.winfo_width(), image.width() + 40)
+            canvas_height = max(canvas.winfo_height(), image.height() + 40)
+            x = max(20, (canvas_width - image.width()) // 2)
+            y = max(20, (canvas_height - image.height()) // 2)
+            canvas.create_image(x, y, image=image, anchor="nw")
+            canvas.configure(scrollregion=(0, 0, canvas_width, canvas_height))
+            zoom.preview_image = image
+        else:
+            canvas.create_text(
+                420,
+                260,
+                text=f"第 {page_num} 页\n当前环境未安装 PyMuPDF，无法渲染放大预览。",
+                fill="white",
+                font=("微软雅黑", 18, "bold"),
+                justify="center",
+            )
+            canvas.configure(scrollregion=(0, 0, 840, 520))
+
+    def zoom_in():
+        zoom_state["factor"] = min(4.0, zoom_state["factor"] * 1.2)
+        draw_page()
+
+    def zoom_out():
+        zoom_state["factor"] = max(0.25, zoom_state["factor"] / 1.2)
+        draw_page()
+
+    def zoom_fit():
+        zoom_state["factor"] = 1.0
+        draw_page()
+
+    zoom.bind("<Escape>", lambda event: zoom.destroy())
+    zoom.bind("<Control-plus>", lambda event: zoom_in())
+    zoom.bind("<Control-equal>", lambda event: zoom_in())
+    zoom.bind("<Control-minus>", lambda event: zoom_out())
+
+    def on_zoom_mousewheel(event):
+        if event.state & 0x0004:
+            if event.delta > 0:
+                zoom_in()
+            else:
+                zoom_out()
+            return "break"
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    canvas.bind("<MouseWheel>", on_zoom_mousewheel)
+    zoom.after(80, draw_page)
+
+
+def show_pdf_preview_legacy(path):
+    try:
+        reader = PdfReader(path)
+        total_pages = len(reader.pages)
+    except Exception as exc:
+        messagebox.showerror("预览失败", f"无法读取 PDF：\n{exc}")
+        log(f"[ERROR]预览读取失败:{exc}", "error")
+        return
+
+    if total_pages <= 0:
+        messagebox.showwarning("预览失败", "PDF 没有可预览页面。")
+        return
+
+    window = tk.Toplevel(root)
+    window.title("PDF 可视化拆分预览")
+    window.minsize(760, 560)
+    window.configure(bg="#eef2f7")
+    try:
+        window.state("zoomed")
+    except Exception:
+        window.geometry(
+            f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0"
+        )
+
+    header = tk.Frame(window, bg="#eef2f7")
+    header.pack(fill="x", padx=14, pady=(12, 8))
+
+    tk.Label(
+        header,
+        text="勾选页面作为拆分段的起止页：第1个勾选=起始页，第2个勾选=终止页，依次成对。",
+        bg="#eef2f7",
+        fg=TEXT,
+        font=("微软雅黑", 10),
+        anchor="w",
+    ).pack(fill="x")
+
+    range_var = tk.StringVar(value="未选择拆分范围")
+    tk.Label(
+        header,
+        textvariable=range_var,
+        bg="#eef2f7",
+        fg=PRIMARY,
+        font=("微软雅黑", 10, "bold"),
+        anchor="w",
+    ).pack(fill="x", pady=(5, 0))
+
+    body = tk.Frame(window, bg="#eef2f7")
+    body.pack(fill="both", expand=True, padx=0, pady=(0, 8))
+    canvas = tk.Canvas(body, bg="#eef2f7", highlightthickness=0)
+    scroll_y = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scroll_y.set)
+    scroll_y.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+
+    grid = tk.Frame(canvas, bg="#eef2f7")
+    canvas_window = canvas.create_window((0, 0), window=grid, anchor="nw")
+    page_vars = []
+    thumbnails = []
+    tiles = []
+    columns = {"value": 4}
+
+    def selected_pages():
+        return [index + 1 for index, var in enumerate(page_vars) if var.get()]
+
+    def refresh_ranges():
+        ranges = pair_checked_pages(selected_pages())
+        text = format_page_ranges(ranges) if ranges else "未选择拆分范围"
+        if len(selected_pages()) % 2:
+            text += "  （最后一个勾选页会作为单页拆分）"
+        range_var.set(f"当前范围：{text}")
+
+    def layout_tiles():
+        width = max(canvas.winfo_width(), 760)
+        tile_step = 188
+        side_gap = 32
+        usable_width = max(tile_step, width - (side_gap * 2))
+        next_columns = max(1, usable_width // tile_step)
+        grid_width = next_columns * tile_step
+        columns["value"] = next_columns
+        canvas.coords(canvas_window, max(0, (canvas.winfo_width() - grid_width) // 2), 0)
+        for index, tile in enumerate(tiles):
+            tile.grid_configure(
+                row=index // columns["value"],
+                column=index % columns["value"],
+            )
+
+    for index in range(total_pages):
+        page_num = index + 1
+        tile = tk.Frame(grid, bg=CARD, highlightthickness=1, highlightbackground="#d0d5dd")
+        tiles.append(tile)
+        tile.grid(row=index // columns["value"], column=index % columns["value"], padx=8, pady=8, sticky="n")
+
+        preview = render_pdf_thumbnail(path, index)
+        if preview:
+            thumbnails.append(preview)
+            image_label = tk.Label(tile, image=preview, bg=CARD)
+            image_label.pack(padx=8, pady=(8, 4))
+            image_label.bind(
+                "<Button-1>",
+                lambda event, page_index=index, num=page_num: show_page_zoom(path, page_index, num),
+            )
+            image_label.config(cursor="hand2")
+        else:
+            placeholder = make_placeholder_thumbnail(tile, page_num)
+            placeholder.pack(padx=8, pady=(8, 4))
+            placeholder.bind(
+                "<Button-1>",
+                lambda event, page_index=index, num=page_num: show_page_zoom(path, page_index, num),
+            )
+
+        var = tk.BooleanVar(value=False)
+        page_vars.append(var)
+        check = tk.Checkbutton(
+            tile,
+            variable=var,
+            command=refresh_ranges,
+            bg=CARD,
+            activebackground=CARD,
+            selectcolor=CARD,
+        )
+        check.place(x=6, y=6)
+
+        tk.Label(
+            tile,
+            text=f"第 {page_num} 页",
+            bg=CARD,
+            fg=TEXT,
+            font=("微软雅黑", 9),
+        ).pack(pady=(0, 8))
+
+    window.preview_images = thumbnails
+
+    def update_scroll_region(event=None):
+        layout_tiles()
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    grid.bind("<Configure>", update_scroll_region)
+    canvas.bind("<Configure>", update_scroll_region)
+    window.bind("<MouseWheel>", on_mousewheel)
+
+    buttons = tk.Frame(window, bg="#eef2f7")
+    buttons.pack(fill="x", padx=14, pady=(0, 12))
+
+    def clear_selection():
+        for var in page_vars:
+            var.set(False)
+        refresh_ranges()
+
+    def use_selection():
+        ranges = pair_checked_pages(selected_pages())
+        if not ranges:
+            messagebox.showwarning("未选择页面", "请至少勾选一个页面作为拆分范围。")
+            return
+        set_visual_split(path, ranges)
+        window.destroy()
+
+    tk.Button(
+        buttons,
+        text="清空选择",
+        bg="#98a2b3",
+        fg="white",
+        relief="flat",
+        command=clear_selection,
+    ).pack(side="left", ipadx=16, ipady=5)
+    tk.Button(
+        buttons,
+        text="取消",
+        bg="#98a2b3",
+        fg="white",
+        relief="flat",
+        command=window.destroy,
+    ).pack(side="right", padx=(8, 0), ipadx=16, ipady=5)
+    tk.Button(
+        buttons,
+        text="使用选择",
+        bg=PRIMARY,
+        fg="white",
+        activebackground=PRIMARY_HOVER,
+        activeforeground="white",
+        relief="flat",
+        command=use_selection,
+    ).pack(side="right", ipadx=18, ipady=5)
+
+    refresh_ranges()
+
+
 # ====== 文件 ======
+def show_pdf_preview(path):
+    try:
+        reader = PdfReader(path)
+        total_pages = len(reader.pages)
+    except Exception as exc:
+        messagebox.showerror("预览失败", f"无法读取 PDF：\n{exc}")
+        log(f"[ERROR]预览读取失败:{exc}", "error")
+        return
+
+    if total_pages <= 0:
+        messagebox.showwarning("预览失败", "PDF 没有可预览页面。")
+        return
+
+    window = tk.Toplevel(root)
+    window.title("PDF 可视化拆分预览")
+    window.minsize(760, 560)
+    window.configure(bg="#eef2f7")
+    try:
+        window.state("zoomed")
+    except Exception:
+        window.geometry(
+            f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0"
+        )
+
+    header = tk.Frame(window, bg="#eef2f7")
+    header.pack(fill="x", padx=14, pady=(12, 8))
+
+    tk.Label(
+        header,
+        text="勾选页面作为拆分段的起止页：第1个勾选为起始页，第2个勾选为终止页，依次成对。",
+        bg="#eef2f7",
+        fg=TEXT,
+        font=("Microsoft YaHei", 10),
+        anchor="w",
+    ).pack(fill="x")
+
+    range_var = tk.StringVar(value="未选择拆分范围")
+    tk.Label(
+        header,
+        textvariable=range_var,
+        bg="#eef2f7",
+        fg=PRIMARY,
+        font=("Microsoft YaHei", 10, "bold"),
+        anchor="w",
+    ).pack(fill="x", pady=(5, 0))
+
+    body = tk.Frame(window, bg="#eef2f7")
+    body.pack(fill="both", expand=True, padx=0, pady=(0, 8))
+    canvas = tk.Canvas(body, bg="#eef2f7", highlightthickness=0)
+    scroll_y = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scroll_y.set)
+    scroll_y.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+
+    selected = set()
+    thumb_cache = OrderedDict()
+    render_queue = queue.Queue()
+    request_queue = queue.Queue()
+    priority_request_queue = queue.Queue()
+    pending_pages = set()
+    failed_pages = set()
+    queued_pages = set()
+    priority_pages = set()
+    stop_render = threading.Event()
+    layout = {"columns": 1, "grid_width": PREVIEW_TILE_X_STEP, "x0": 0, "height": 0}
+    redraw_scheduled = {"value": False}
+
+    def selected_pages():
+        return sorted(selected)
+
+    def refresh_ranges():
+        pages = selected_pages()
+        ranges = pair_checked_pages(pages)
+        text = format_page_ranges(ranges) if ranges else "未选择拆分范围"
+        if len(pages) % 2:
+            text += "  （最后一个勾选页会作为单页拆分）"
+        range_var.set(f"当前范围：{text}")
+
+    def update_layout():
+        width = max(canvas.winfo_width(), 760)
+        usable_width = max(PREVIEW_TILE_X_STEP, width - 64)
+        columns = max(1, usable_width // PREVIEW_TILE_X_STEP)
+        rows = (total_pages + columns - 1) // columns
+        grid_width = columns * PREVIEW_TILE_X_STEP
+        layout.update(
+            {
+                "columns": columns,
+                "grid_width": grid_width,
+                "x0": max(0, (canvas.winfo_width() - grid_width) // 2),
+                "height": rows * PREVIEW_TILE_Y_STEP,
+            }
+        )
+        canvas.configure(scrollregion=(0, 0, max(width, grid_width), layout["height"]))
+
+    def page_rect(index):
+        row = index // layout["columns"]
+        column = index % layout["columns"]
+        x = layout["x0"] + column * PREVIEW_TILE_X_STEP + 8
+        y = row * PREVIEW_TILE_Y_STEP + 8
+        return x, y, x + PREVIEW_TILE_WIDTH, y + PREVIEW_TILE_HEIGHT
+
+    def visible_indexes(buffer_rows=2):
+        update_layout()
+        top = canvas.canvasy(0)
+        bottom = canvas.canvasy(canvas.winfo_height())
+        first_row = max(0, int(top // PREVIEW_TILE_Y_STEP) - buffer_rows)
+        last_row = min(
+            (total_pages - 1) // layout["columns"],
+            int(bottom // PREVIEW_TILE_Y_STEP) + buffer_rows,
+        )
+        start = first_row * layout["columns"]
+        end = min(total_pages, (last_row + 1) * layout["columns"])
+        return range(start, end)
+
+    def queue_thumbnail(index, priority=False):
+        if index in thumb_cache or index in failed_pages:
+            return
+
+        if priority:
+            if index in priority_pages:
+                return
+            priority_pages.add(index)
+            pending_pages.add(index)
+            priority_request_queue.put(index)
+            return
+
+        if index in queued_pages:
+            return
+        queued_pages.add(index)
+        pending_pages.add(index)
+        request_queue.put(index)
+
+    def queue_all_thumbnails(start_index=0):
+        if stop_render.is_set() or not window.winfo_exists():
+            return
+
+        end_index = min(total_pages, start_index + PREVIEW_QUEUE_BATCH)
+        for index in range(start_index, end_index):
+            queue_thumbnail(index)
+
+        if end_index < total_pages:
+            window.after(
+                PREVIEW_QUEUE_DELAY_MS,
+                lambda: queue_all_thumbnails(end_index),
+            )
+
+    def worker_loop():
+        while not stop_render.is_set():
+            try:
+                index = priority_request_queue.get_nowait()
+            except queue.Empty:
+                try:
+                    index = request_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+            if index in thumb_cache or index in failed_pages:
+                pending_pages.discard(index)
+                queued_pages.discard(index)
+                priority_pages.discard(index)
+                continue
+            data = render_pdf_thumbnail_data(
+                path,
+                index,
+                width=PREVIEW_THUMB_WIDTH,
+                max_height=PREVIEW_THUMB_MAX_HEIGHT,
+            )
+            if not stop_render.is_set():
+                render_queue.put((index, data))
+
+    def draw_checkbox(x, y, checked):
+        size = 14
+
+        canvas.create_rectangle(
+            x,
+            y,
+            x + size,
+            y + size,
+            fill=PRIMARY if checked else CARD,
+            outline=PRIMARY if checked else "#98a2b3",
+         )
+
+    def draw_placeholder(x, y, page_num):
+        canvas.create_rectangle(
+            x,
+            y,
+            x + PREVIEW_THUMB_WIDTH,
+            y + PREVIEW_THUMB_MAX_HEIGHT,
+            fill="#f8fafc",
+            outline="#d0d5dd",
+        )
+        canvas.create_text(
+            x + PREVIEW_THUMB_WIDTH // 2,
+            y + PREVIEW_THUMB_MAX_HEIGHT // 2,
+            text=f"第 {page_num} 页",
+            fill=MUTED,
+            font=("Microsoft YaHei", 13, "bold"),
+        )
+
+    def redraw():
+        canvas.delete("all")
+        for index in visible_indexes():
+            page_num = index + 1
+            x1, y1, x2, y2 = page_rect(index)
+            canvas.create_rectangle(x1, y1, x2, y2, fill=CARD, outline="#d0d5dd")
+
+            img_x = x1 + 11
+            img_y = y1 + 8
+            image = thumb_cache.get(index)
+            if image:
+                thumb_cache.move_to_end(index)
+                canvas.create_image(img_x, img_y, image=image, anchor="nw")
+            else:
+                draw_placeholder(img_x, img_y, page_num)
+                queue_thumbnail(index, priority=True)
+
+            draw_checkbox(x1 + 6, y1 + 6, page_num in selected)
+            canvas.create_text(
+                x1 + PREVIEW_TILE_WIDTH // 2,
+                y2 - 17,
+                text=f"第 {page_num} 页",
+                fill=TEXT,
+                font=("Microsoft YaHei", 9),
+            )
+
+    def schedule_redraw(delay=PREVIEW_REDRAW_DELAY_MS):
+        if redraw_scheduled["value"] or stop_render.is_set():
+            return
+        redraw_scheduled["value"] = True
+
+        def run_redraw():
+            redraw_scheduled["value"] = False
+            if not stop_render.is_set() and window.winfo_exists():
+                redraw()
+
+        window.after(delay, run_redraw)
+
+    def pump_render_queue():
+        changed = False
+        while True:
+            try:
+                index, data = render_queue.get_nowait()
+            except queue.Empty:
+                break
+            pending_pages.discard(index)
+            queued_pages.discard(index)
+            priority_pages.discard(index)
+            if data:
+                try:
+                    thumb_cache[index] = tk.PhotoImage(data=data, format="PPM")
+                    thumb_cache.move_to_end(index)
+                    changed = True
+                except Exception:
+                    failed_pages.add(index)
+            else:
+                failed_pages.add(index)
+        if changed:
+            schedule_redraw()
+        if window.winfo_exists() and not stop_render.is_set():
+            window.after(60, pump_render_queue)
+
+    def on_canvas_configure(event=None):
+        schedule_redraw()
+
+    def on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        schedule_redraw()
+        return "break"
+
+    def on_scrollbar(*args):
+        canvas.yview(*args)
+        schedule_redraw()
+
+    def on_click(event):
+        x = canvas.canvasx(event.x)
+        y = canvas.canvasy(event.y)
+        column = int((x - layout["x0"]) // PREVIEW_TILE_X_STEP)
+        row = int(y // PREVIEW_TILE_Y_STEP)
+        if column < 0 or column >= layout["columns"] or row < 0:
+            return
+
+        index = row * layout["columns"] + column
+        if index < 0 or index >= total_pages:
+            return
+
+        x1, y1, x2, y2 = page_rect(index)
+        if not (x1 <= x <= x2 and y1 <= y <= y2):
+            return
+
+        page_num = index + 1
+        if x1 + 6 <= x <= x1 + 24 and y1 + 6 <= y <= y1 + 24:
+            if page_num in selected:
+                selected.remove(page_num)
+            else:
+                selected.add(page_num)
+            refresh_ranges()
+            schedule_redraw(0)
+            return
+
+        if (
+            x1 + 11 <= x <= x1 + 11 + PREVIEW_THUMB_WIDTH
+            and y1 + 8 <= y <= y1 + 8 + PREVIEW_THUMB_MAX_HEIGHT
+        ):
+            show_page_zoom(path, index, page_num)
+
+    def on_close():
+        stop_render.set()
+        window.destroy()
+
+    canvas.bind("<Configure>", on_canvas_configure)
+    canvas.bind("<Button-1>", on_click)
+    scroll_y.config(command=on_scrollbar)
+    window.bind("<MouseWheel>", on_mousewheel)
+    window.protocol("WM_DELETE_WINDOW", on_close)
+    window.preview_images = thumb_cache
+
+    buttons = tk.Frame(window, bg="#eef2f7")
+    buttons.pack(fill="x", padx=14, pady=(0, 12))
+
+    def clear_selection():
+        selected.clear()
+        refresh_ranges()
+        schedule_redraw(0)
+
+    def use_selection():
+        ranges = pair_checked_pages(selected_pages())
+        if not ranges:
+            messagebox.showwarning("未选择页面", "请至少勾选一个页面作为拆分范围。")
+            return
+        set_visual_split(path, ranges)
+        on_close()
+
+    tk.Button(
+        buttons,
+        text="清空选择",
+        bg="#98a2b3",
+        fg="white",
+        relief="flat",
+        command=clear_selection,
+    ).pack(side="left", ipadx=16, ipady=5)
+    tk.Button(
+        buttons,
+        text="取消",
+        bg="#98a2b3",
+        fg="white",
+        relief="flat",
+        command=on_close,
+    ).pack(side="right", padx=(8, 0), ipadx=16, ipady=5)
+    tk.Button(
+        buttons,
+        text="使用选择",
+        bg=PRIMARY,
+        fg="white",
+        activebackground=PRIMARY_HOVER,
+        activeforeground="white",
+        relief="flat",
+        command=use_selection,
+    ).pack(side="right", ipadx=18, ipady=5)
+
+    def start_preview_loading():
+        window.update_idletasks()
+        redraw()
+        threading.Thread(target=worker_loop, daemon=True).start()
+        queue_all_thumbnails()
+        pump_render_queue()
+
+    refresh_ranges()
+    window.after_idle(start_preview_loading)
+
+
 def select_file():
     global multi_files
     files = filedialog.askopenfilenames(
         filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")]
     )
     if files:
+        clear_visual_split()
         multi_files = list(files)
         input_pdf.set(files[0])
         log(f"[INFO]已选择{len(files)}个文件")
@@ -614,6 +1359,7 @@ def drop(event):
     except Exception:
         files = [event.data.strip("{}").strip('"')]
 
+    clear_visual_split()
     multi_files = list(files)
 
     if files:
@@ -622,9 +1368,16 @@ def drop(event):
         for file_path in files:
             log(f"[FILE]{file_path}")
 
+        if (
+            preview_on_drop.get()
+            and len(files) == 1
+            and files[0].lower().endswith(".pdf")
+        ):
+            show_pdf_preview(files[0])
+
 
 # ====== 主逻辑 ======
-def process_worker(path, outdir, rule, name_inputs, selected_files, save_csv):
+def process_worker(path, outdir, rule, name_inputs, selected_files, save_csv, visual_ranges):
     start_time = time.time()
     try:
         log_block("开始处理")
@@ -651,6 +1404,10 @@ def process_worker(path, outdir, rule, name_inputs, selected_files, save_csv):
 
         if len(selected_files) > 1:
             rename_multi_files(selected_files, name_inputs)
+            return
+
+        if visual_ranges:
+            split_pdf_ranges(path, outdir, visual_ranges, name_inputs, save_csv, start_time)
             return
 
         split_pdf(path, outdir, rule, name_inputs, save_csv, start_time)
@@ -896,6 +1653,181 @@ def split_pdf(path, outdir, rule, name_inputs, save_csv, start_time):
     log(f"[INFO]耗时:{duration:.2f}s")
 
 
+def split_pdf_ranges(path, outdir, ranges, name_inputs, save_csv, start_time):
+    log(f"[INFO]输入文件:{path}")
+    log(f"[INFO]预览拆分范围:{format_page_ranges(ranges)}")
+
+    if not outdir:
+        outdir = os.getcwd()
+        log(f"[INFO]输出目录未指定，默认使用当前目录:{outdir}")
+    else:
+        try:
+            if not os.path.exists(outdir):
+                os.makedirs(outdir)
+                log(f"[INFO]已创建输出目录:{outdir}")
+            elif not os.path.isdir(outdir):
+                log(f"[ERROR]指定路径不是有效目录:{outdir}", "error")
+                set_progress(
+                    style_name="red.Horizontal.TProgressbar",
+                    mode="determinate",
+                    value=0,
+                    text="失败",
+                    stop=True,
+                    force=True,
+                )
+                return
+        except Exception as exc:
+            log(f"[ERROR]无法创建或访问输出目录:{exc}", "error")
+            set_progress(
+                style_name="red.Horizontal.TProgressbar",
+                mode="determinate",
+                value=0,
+                text="失败",
+                stop=True,
+                force=True,
+            )
+            return
+
+    log(f"[INFO]输出目录:{outdir}")
+
+    try:
+        reader = PdfReader(path)
+        total = len(reader.pages)
+        log(f"[INFO]总页数:{total}")
+    except Exception as exc:
+        log(f"[ERROR]读取失败:{exc}", "error")
+        set_progress(
+            style_name="red.Horizontal.TProgressbar",
+            mode="determinate",
+            value=0,
+            text="失败",
+            stop=True,
+            force=True,
+        )
+        return
+
+    normalized_ranges = []
+    for start, end in ranges:
+        if start < 1 or end < 1 or start > total:
+            log(f"[ERROR]拆分范围超出页数:{start}-{end}", "error")
+            set_progress(
+                style_name="red.Horizontal.TProgressbar",
+                mode="determinate",
+                value=0,
+                text="失败",
+                stop=True,
+                force=True,
+            )
+            return
+        end = min(end, total)
+        if end < start:
+            start, end = end, start
+        normalized_ranges.append((start, end))
+
+    if not normalized_ranges:
+        log("[ERROR]未选择拆分范围", "error")
+        set_progress(
+            style_name="red.Horizontal.TProgressbar",
+            mode="determinate",
+            value=0,
+            text="失败",
+            stop=True,
+            force=True,
+        )
+        return
+
+    if not prepare_output_dir(outdir):
+        return
+
+    set_progress(
+        style_name="blue.Horizontal.TProgressbar",
+        mode="determinate",
+        value=0,
+        stop=True,
+        force=True,
+    )
+
+    output_files = []
+    total_pages_to_write = sum(end - start + 1 for start, end in normalized_ranges)
+    written_pages = 0
+
+    for index, (start, end) in enumerate(normalized_ranges, start=1):
+        expected_pages = end - start + 1
+        file_name = f"{index:02d}_pages_{start}-{end}.pdf"
+        log(f"[STEP]第{index}段:起始页{start}|终止页{end}|共{expected_pages}页")
+
+        writer = PdfWriter()
+        for page_num in range(start, end + 1):
+            writer.add_page(reader.pages[page_num - 1])
+
+        full_path, file_name = unique_output_path(outdir, file_name)
+
+        try:
+            with open(full_path, "wb") as file:
+                writer.write(file)
+            log(f"[OK]生成:{full_path}", "ok")
+        except Exception as exc:
+            log(f"[ERROR]写入失败:{file_name} {exc}", "error")
+            set_progress(
+                style_name="red.Horizontal.TProgressbar",
+                mode="determinate",
+                value=0,
+                text="失败",
+                force=True,
+            )
+            return
+
+        output_files.append(
+            {
+                "path": full_path,
+                "name": file_name,
+                "expected": expected_pages,
+                "actual": expected_pages,
+                "generated": True,
+            }
+        )
+
+        written_pages += expected_pages
+        percent = min((written_pages / total_pages_to_write) * 100, 100)
+        set_progress(value=percent, text=f"{percent:.1f}%")
+
+    set_progress(value=100, text="100%", force=True)
+
+    check_results = check_outputs(output_files)
+    if save_csv:
+        write_csv(outdir, check_results)
+    else:
+        log("[INFO]未输出CSV")
+    rename_ok = rename_outputs(outdir, output_files, name_inputs)
+
+    duration = time.time() - start_time
+    errors = sum(1 for item in check_results if item["结果"] != "正确")
+    if errors or not rename_ok:
+        progress_text = "页数不一致" if errors else "失败"
+        set_progress(
+            style_name="red.Horizontal.TProgressbar",
+            mode="determinate",
+            value=100,
+            text=progress_text,
+            force=True,
+        )
+        if errors:
+            ui(lambda: messagebox.showwarning("页数不一致", f"发现 {errors} 个文件页数与选择范围不一致，请查看运行日志。"))
+    else:
+        set_progress(
+            style_name="green.Horizontal.TProgressbar",
+            mode="determinate",
+            value=100,
+            text="完成",
+            force=True,
+        )
+
+    log_block("完成")
+    log(f"[INFO]输出:{len(output_files)}")
+    log(f"[INFO]错误:{errors}")
+    log(f"[INFO]耗时:{duration:.2f}s")
+
+
 def check_outputs(output_files):
     log_block("校验")
     result = []
@@ -1014,10 +1946,15 @@ def start_process():
     selected_files = list(multi_files)
     if selected_files and path != selected_files[0]:
         selected_files = [path]
+    active_visual_ranges = (
+        visual_split_ranges[:]
+        if visual_split_path and os.path.abspath(path) == os.path.abspath(visual_split_path)
+        else []
+    )
 
     threading.Thread(
         target=process_worker,
-        args=(path, outdir, rule, name_inputs, selected_files, save_csv),
+        args=(path, outdir, rule, name_inputs, selected_files, save_csv, active_visual_ranges),
         daemon=True,
     ).start()
 
@@ -1049,25 +1986,32 @@ usage_tooltip_text = (
     "1. 选择文件\n"
     "   选择或拖入 PDF 文件，单文件用于拆分。\n"
     "   一次选择多个文件时，用于批量重命名。\n\n"
-    "2. 规则拆分\n"
+    "2. 可视化预览拆分\n"
+    "   勾选“拖入单文件时预览拆分”后，拖入单个 PDF 会进入预览。\n"
+    "   每页会平铺显示，点击页面可放大查看。\n"
+    "   勾选页面左上角复选框作为拆分段起止页，按勾选顺序两两配对。\n"
+    "   例如勾选 1、3、6、10 会拆分为 1-3、6-10。\n"
+    "   例如勾选 1、8、9、12 可连续拆分为 1-8、9-12。\n"
+    "   未落入勾选范围的页面不会输出。\n\n"
+    "3. 规则拆分\n"
     "   只输入一个数字，例如 3。\n"
     "   程序会按每 3 页一直拆到 PDF 结束。\n"
     "   每段期望页数都按手动输入的 3 计算。\n\n"
-    "3. 不规则拆分\n"
+    "4. 不规则拆分\n"
     "   输入多个数字，例如 2,3,5。\n"
     "   也可以逐行输入 2、3、5。\n"
     "   期望页数只取手动输入的每个数字。\n\n"
-    "4. 页数校验\n"
+    "5. 页数校验\n"
     "   实际页数与期望页数不一致时会提示。\n"
     "   日志标红、进度条变红，并弹窗提醒。\n\n"
-    "5. 文件命名\n"
+    "6. 文件命名\n"
     "   新文件名可选，左右两组都支持逐行或逗号分隔。\n"
     "   只填写左侧时，保持旧逻辑按左侧顺序命名。\n"
     "   右侧第二组有内容时，按左1、右1、左2、右2交替命名。\n"
     "   交替命名时，左侧数量需等于右侧，或只比右侧多 1 个。\n"
     "   最终名称数量必须与需要命名的文件总数一致。\n"
     "   文件名不能重复，已存在文件不会覆盖。\n\n"
-    "6. 输出设置\n"
+    "7. 输出设置\n"
     "   输出路径为空时，默认使用当前目录。\n"
     "   路径不存在时，程序会自动创建。\n"
     "   输出文件夹已有内容时，可选择清空运行、不清空运行或取消操作。\n"
@@ -1087,8 +2031,10 @@ btn_file = action_button(c1, "选择文件", select_file)
 c_out = card("输出路径")
 styled_entry(c_out, output_dir)
 btn_folder = action_button(c_out, "选择文件夹", select_folder)
+output_options = tk.Frame(c_out, bg=CARD)
+output_options.pack(fill="x", padx=14, pady=(0, 12))
 tk.Checkbutton(
-    c_out,
+    output_options,
     text="输出 CSV 校验表",
     variable=output_csv,
     bg=CARD,
@@ -1098,7 +2044,19 @@ tk.Checkbutton(
     selectcolor=CARD,
     font=("微软雅黑", 10),
     anchor="w",
-).pack(fill="x", padx=14, pady=(0, 12))
+).pack(side="left")
+tk.Checkbutton(
+    output_options,
+    text="拖入单文件时预览拆分",
+    variable=preview_on_drop,
+    bg=CARD,
+    fg=TEXT,
+    activebackground=CARD,
+    activeforeground=TEXT,
+    selectcolor=CARD,
+    font=("微软雅黑", 10),
+    anchor="w",
+).pack(side="left", padx=(18, 0))
 
 c2 = card("拆分规则")
 text_rules = styled_text(c2, 5)
