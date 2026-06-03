@@ -44,8 +44,6 @@ PREVIEW_TILE_WIDTH = 172
 PREVIEW_TILE_HEIGHT = 250
 PREVIEW_TILE_X_STEP = 188
 PREVIEW_TILE_Y_STEP = 266
-PREVIEW_QUEUE_BATCH = 40
-PREVIEW_QUEUE_DELAY_MS = 15
 PREVIEW_REDRAW_DELAY_MS = 16
 log_lock = threading.Lock()
 pending_logs = []
@@ -63,10 +61,19 @@ def resource_path(relative_path):
 
 
 icon_path = resource_path("icon.ico")
-try:
-    root.iconbitmap(icon_path)
-except Exception:
-    pass
+
+
+def set_window_icon(window):
+    try:
+        if os.path.exists(icon_path):
+            window.iconbitmap(icon_path)
+            if window is root:
+                window.iconbitmap(default=icon_path)
+    except Exception:
+        pass
+
+
+set_window_icon(root)
 
 
 # ====== 样式 ======
@@ -581,21 +588,31 @@ def action_button(parent, text, command):
 
 
 class Tooltip:
+    MAX_WRAP_LENGTH = 380
+    EDGE_PADDING = 8
+    POINTER_OFFSET = 16
+
     def __init__(self, widget, text):
         self.widget = widget
         self.text = text
         self.tip = None
+        self.hide_job = None
         widget.bind("<Enter>", self.show)
-        widget.bind("<Leave>", self.hide)
+        widget.bind("<Leave>", self.schedule_hide)
         widget.bind("<Motion>", self.move)
 
     def show(self, event=None):
+        self.cancel_hide()
         if self.tip:
             return
 
         self.tip = tk.Toplevel(self.widget)
         self.tip.wm_overrideredirect(True)
         self.tip.configure(bg="#d0d5dd")
+        self.tip.bind("<Enter>", self.cancel_hide)
+        self.tip.bind("<Leave>", self.schedule_hide)
+
+        wrap_length = max(260, min(self.MAX_WRAP_LENGTH, root.winfo_width() - 120))
 
         label = tk.Label(
             self.tip,
@@ -607,23 +624,48 @@ class Tooltip:
             relief="flat",
             padx=12,
             pady=10,
-            wraplength=560,
+            wraplength=wrap_length,
         )
         label.pack(padx=1, pady=1)
+
         self.move(event)
 
     def move(self, event=None):
         if not self.tip:
             return
 
-        x = self.widget.winfo_pointerx() + 16
-        y = self.widget.winfo_pointery() + 16
-        self.tip.wm_geometry(f"+{x}+{y}")
+        self.tip.update_idletasks()
+        root_x = root.winfo_rootx()
+        root_y = root.winfo_rooty()
+        root_width = root.winfo_width()
+        root_height = root.winfo_height()
+        max_width = max(1, root_width - self.EDGE_PADDING * 2)
+        max_height = max(1, root_height - self.EDGE_PADDING * 2)
+        tip_width = min(self.tip.winfo_reqwidth(), max_width)
+        tip_height = min(self.tip.winfo_reqheight(), max_height)
+
+        x = self.widget.winfo_pointerx() + self.POINTER_OFFSET
+        y = self.widget.winfo_pointery() + self.POINTER_OFFSET
+        x = min(x, root_x + root_width - tip_width - self.EDGE_PADDING)
+        y = min(y, root_y + root_height - tip_height - self.EDGE_PADDING)
+        x = max(root_x + self.EDGE_PADDING, x)
+        y = max(root_y + self.EDGE_PADDING, y)
+        self.tip.wm_geometry(f"{tip_width}x{tip_height}+{x}+{y}")
 
     def hide(self, event=None):
+        self.hide_job = None
         if self.tip:
             self.tip.destroy()
             self.tip = None
+
+    def schedule_hide(self, event=None):
+        self.cancel_hide()
+        self.hide_job = self.widget.after(250, self.hide)
+
+    def cancel_hide(self, event=None):
+        if self.hide_job:
+            self.widget.after_cancel(self.hide_job)
+            self.hide_job = None
 
 
 def hover(btn):
@@ -631,35 +673,25 @@ def hover(btn):
     btn.bind("<Leave>", lambda event: btn.config(bg=PRIMARY))
 
 
+def render_pdf_page_data(doc, page_index, width=150, max_height=None):
+    import fitz
+
+    page = doc.load_page(page_index)
+    scale = width / page.rect.width
+    if max_height:
+        scale = min(scale, max_height / page.rect.height)
+    matrix = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    return pix.tobytes("ppm")
+
+
 def render_pdf_thumbnail(path, page_index, width=150, max_height=None):
     try:
         import fitz
 
         with fitz.open(path) as doc:
-            page = doc.load_page(page_index)
-            scale = width / page.rect.width
-            if max_height:
-                scale = min(scale, max_height / page.rect.height)
-            matrix = fitz.Matrix(scale, scale)
-            pix = page.get_pixmap(matrix=matrix, alpha=False)
-            data = pix.tobytes("ppm")
+            data = render_pdf_page_data(doc, page_index, width, max_height)
         return tk.PhotoImage(data=data, format="PPM")
-    except Exception:
-        return None
-
-
-def render_pdf_thumbnail_data(path, page_index, width=150, max_height=None):
-    try:
-        import fitz
-
-        with fitz.open(path) as doc:
-            page = doc.load_page(page_index)
-            scale = width / page.rect.width
-            if max_height:
-                scale = min(scale, max_height / page.rect.height)
-            matrix = fitz.Matrix(scale, scale)
-            pix = page.get_pixmap(matrix=matrix, alpha=False)
-            return pix.tobytes("ppm")
     except Exception:
         return None
 
@@ -685,6 +717,7 @@ def make_placeholder_thumbnail(parent, page_num, width=150, height=210):
 
 def show_page_zoom(path, page_index, page_num):
     zoom = tk.Toplevel(root)
+    set_window_icon(zoom)
     zoom.title(f"第 {page_num} 页")
     zoom.configure(bg="#111827")
     try:
@@ -786,6 +819,7 @@ def show_pdf_preview_legacy(path):
         return
 
     window = tk.Toplevel(root)
+    set_window_icon(window)
     window.title("PDF 可视化拆分预览")
     window.minsize(760, 560)
     window.configure(bg="#eef2f7")
@@ -976,6 +1010,7 @@ def show_pdf_preview(path):
         return
 
     window = tk.Toplevel(root)
+    set_window_icon(window)
     window.title("PDF 可视化拆分预览")
     window.minsize(760, 560)
     window.configure(bg="#eef2f7")
@@ -1019,11 +1054,8 @@ def show_pdf_preview(path):
     selected = set()
     thumb_cache = OrderedDict()
     render_queue = queue.Queue()
-    request_queue = queue.Queue()
     priority_request_queue = queue.Queue()
-    pending_pages = set()
     failed_pages = set()
-    queued_pages = set()
     priority_pages = set()
     stop_render = threading.Event()
     layout = {"columns": 1, "grid_width": PREVIEW_TILE_X_STEP, "x0": 0, "height": 0}
@@ -1076,60 +1108,46 @@ def show_pdf_preview(path):
         end = min(total_pages, (last_row + 1) * layout["columns"])
         return range(start, end)
 
-    def queue_thumbnail(index, priority=False):
+    def queue_thumbnail(index):
         if index in thumb_cache or index in failed_pages:
             return
 
-        if priority:
-            if index in priority_pages:
-                return
-            priority_pages.add(index)
-            pending_pages.add(index)
-            priority_request_queue.put(index)
+        if index in priority_pages:
             return
 
-        if index in queued_pages:
-            return
-        queued_pages.add(index)
-        pending_pages.add(index)
-        request_queue.put(index)
-
-    def queue_all_thumbnails(start_index=0):
-        if stop_render.is_set() or not window.winfo_exists():
-            return
-
-        end_index = min(total_pages, start_index + PREVIEW_QUEUE_BATCH)
-        for index in range(start_index, end_index):
-            queue_thumbnail(index)
-
-        if end_index < total_pages:
-            window.after(
-                PREVIEW_QUEUE_DELAY_MS,
-                lambda: queue_all_thumbnails(end_index),
-            )
+        priority_pages.add(index)
+        priority_request_queue.put(index)
 
     def worker_loop():
-        while not stop_render.is_set():
-            try:
-                index = priority_request_queue.get_nowait()
-            except queue.Empty:
+        try:
+            import fitz
+
+            doc = fitz.open(path)
+        except Exception:
+            return
+
+        try:
+            while not stop_render.is_set():
                 try:
-                    index = request_queue.get(timeout=0.2)
+                    index = priority_request_queue.get(timeout=0.2)
                 except queue.Empty:
                     continue
-            if index in thumb_cache or index in failed_pages:
-                pending_pages.discard(index)
-                queued_pages.discard(index)
-                priority_pages.discard(index)
-                continue
-            data = render_pdf_thumbnail_data(
-                path,
-                index,
-                width=PREVIEW_THUMB_WIDTH,
-                max_height=PREVIEW_THUMB_MAX_HEIGHT,
-            )
-            if not stop_render.is_set():
-                render_queue.put((index, data))
+                if index in thumb_cache or index in failed_pages:
+                    priority_pages.discard(index)
+                    continue
+                try:
+                    data = render_pdf_page_data(
+                        doc,
+                        index,
+                        width=PREVIEW_THUMB_WIDTH,
+                        max_height=PREVIEW_THUMB_MAX_HEIGHT,
+                    )
+                except Exception:
+                    data = None
+                if not stop_render.is_set():
+                    render_queue.put((index, data))
+        finally:
+            doc.close()
 
     def draw_checkbox(x, y, checked):
         size = 14
@@ -1175,7 +1193,7 @@ def show_pdf_preview(path):
                 canvas.create_image(img_x, img_y, image=image, anchor="nw")
             else:
                 draw_placeholder(img_x, img_y, page_num)
-                queue_thumbnail(index, priority=True)
+                queue_thumbnail(index)
 
             draw_checkbox(x1 + 6, y1 + 6, page_num in selected)
             canvas.create_text(
@@ -1205,8 +1223,6 @@ def show_pdf_preview(path):
                 index, data = render_queue.get_nowait()
             except queue.Empty:
                 break
-            pending_pages.discard(index)
-            queued_pages.discard(index)
             priority_pages.discard(index)
             if data:
                 try:
@@ -1324,7 +1340,6 @@ def show_pdf_preview(path):
         window.update_idletasks()
         redraw()
         threading.Thread(target=worker_loop, daemon=True).start()
-        queue_all_thumbnails()
         pump_render_queue()
 
     refresh_ranges()
@@ -1965,7 +1980,7 @@ c_tip.config(height=TOP_HEADER_HEIGHT)
 c_tip.pack_propagate(False)
 usage_hint = tk.Label(
     c_tip,
-    text="鼠标停在这里查看使用说明（点击打开开源地址）",
+    text="鼠标停在这里查看使用说明；点击打开开源地址",
     bg=CARD,
     fg=MUTED,
     justify="left",
@@ -1982,40 +1997,31 @@ usage_hint.bind(
 )
 usage_tooltip_text = (
     "使用说明\n"
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    "1. 选择文件\n"
-    "   选择或拖入 PDF 文件，单文件用于拆分。\n"
-    "   一次选择多个文件时，用于批量重命名。\n\n"
-    "2. 可视化预览拆分\n"
-    "   勾选“拖入单文件时预览拆分”后，拖入单个 PDF 会进入预览。\n"
-    "   每页会平铺显示，点击页面可放大查看。\n"
-    "   勾选页面左上角复选框作为拆分段起止页，按勾选顺序两两配对。\n"
-    "   例如勾选 1、3、6、10 会拆分为 1-3、6-10。\n"
-    "   例如勾选 1、8、9、12 可连续拆分为 1-8、9-12。\n"
-    "   未落入勾选范围的页面不会输出。\n\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "1. 文件\n"
+    "选择或拖入 1 个 PDF：用于拆分。\n"
+    "一次选择多个文件：只执行批量重命名，不拆分。\n"
+    "拖入文件会自动填入第 1 个文件路径。\n\n"
+    "2. 预览拆分\n"
+    "勾选“拖入单文件时预览拆分”后，拖入单个 PDF 自动打开预览。\n"
+    "缩略图按需加载；点击页面可放大，Esc 关闭放大窗口。\n"
+    "勾选左上角复选框作为起止页，按页码两两配对。\n"
+    "例：1、3、6、10 => 1-3、6-10；最后单个勾选页按单页输出。\n"
+    "未落入勾选范围的页面不会输出，点“使用选择”写入规则框。\n\n"
     "3. 规则拆分\n"
-    "   只输入一个数字，例如 3。\n"
-    "   程序会按每 3 页一直拆到 PDF 结束。\n"
-    "   每段期望页数都按手动输入的 3 计算。\n\n"
-    "4. 不规则拆分\n"
-    "   输入多个数字，例如 2,3,5。\n"
-    "   也可以逐行输入 2、3、5。\n"
-    "   期望页数只取手动输入的每个数字。\n\n"
-    "5. 页数校验\n"
-    "   实际页数与期望页数不一致时会提示。\n"
-    "   日志标红、进度条变红，并弹窗提醒。\n\n"
-    "6. 文件命名\n"
-    "   新文件名可选，左右两组都支持逐行或逗号分隔。\n"
-    "   只填写左侧时，保持旧逻辑按左侧顺序命名。\n"
-    "   右侧第二组有内容时，按左1、右1、左2、右2交替命名。\n"
-    "   交替命名时，左侧数量需等于右侧，或只比右侧多 1 个。\n"
-    "   最终名称数量必须与需要命名的文件总数一致。\n"
-    "   文件名不能重复，已存在文件不会覆盖。\n\n"
-    "7. 输出设置\n"
-    "   输出路径为空时，默认使用当前目录。\n"
-    "   路径不存在时，程序会自动创建。\n"
-    "   输出文件夹已有内容时，可选择清空运行、不清空运行或取消操作。\n"
-    "   勾选输出 CSV 后，才生成拆分结果.csv。\n\n"
+    "输入 3：每 3 页拆一份，直到 PDF 结束；末段不足会校验提示。\n"
+    "输入 2,3,5 或逐行输入：按 2 页、3 页、5 页依次拆分。\n"
+    "规则总页数少于 PDF 总页数时，剩余页面不会自动输出。\n\n"
+    "4. 命名\n"
+    "新文件名可选，支持逗号或换行；不要写 .pdf 后缀。\n"
+    "只填左侧：按左侧顺序命名；右侧有内容：左1、右1、左2、右2 交替。\n"
+    "名称数量必须等于输出文件数；不能重复；已存在文件不会覆盖。\n"
+    "多文件重命名会保留原扩展名。\n\n"
+    "5. 输出\n"
+    "输出路径为空时使用当前目录；目录不存在会自动创建。\n"
+    "输出目录已有内容时，可选择清空、不清空或取消。\n"
+    "勾选“输出 CSV 校验表”后生成拆分结果.csv。\n"
+    "运行日志会显示生成、校验、错误和耗时。\n\n"
     "by xinling"
 )
 Tooltip(usage_hint, usage_tooltip_text)
