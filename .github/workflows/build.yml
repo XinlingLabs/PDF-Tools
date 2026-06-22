@@ -8,11 +8,11 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # 1. 升级到 checkout v5 (支持 Node.js 24)
+      # 拉取仓库代码
       - name: Checkout
         uses: actions/checkout@v5
 
-      # 2. 调试步骤 - 确认文件存在
+      # 检查打包所需资源文件
       - name: List Files
         run: |
           Write-Host "当前目录文件列表:"
@@ -22,34 +22,40 @@ jobs:
           } else {
               Write-Host "❌ 未找到 icon.ico"
           }
+          if (Test-Path "usage_guide.txt") {
+              Write-Host "✅ 找到 usage_guide.txt"
+          } else {
+              Write-Host "❌ 未找到 usage_guide.txt"
+          }
 
-      # 3. 设置 Python 环境
+      # 准备 Python 构建环境
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
-      # 4. 安装依赖
+      # 安装项目依赖和 PyInstaller
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # 5. 构建 EXE
+      # 使用 PyInstaller 构建 Windows 可执行文件
       - name: Build EXE
         run: |
           $params = @(
             "-w",
             "-i", "icon.ico",
             "--add-data", "icon.ico;.",
+            "--add-data", "usage_guide.txt;.",
             "--collect-all", "tkinterdnd2",
             "--name", "PDF Tools",
             "pdf_tools.py"
           )
           pyinstaller @params
 
-      # 6. 升级到 upload-artifact v7 (支持 Node.js 24)
+      # 上传构建产物
       - name: Upload EXE
         uses: actions/upload-artifact@v7
         with:
