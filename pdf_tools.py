@@ -6,7 +6,6 @@ import sys
 import threading
 import time
 import traceback
-import webbrowser
 from collections import OrderedDict
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -474,10 +473,34 @@ def build_splits(rule, total):
     if not rule:
         raise ValueError("拆分规则不能为空")
 
-    parts = parse_input(rule)
+    parts = parse_input(rule.replace("、", ",").replace("，", ","))
+    loop = parts[-1] in ("*", "＊") if parts else False
+    if loop:
+        parts = parts[:-1]
+
     splits = [int(item) for item in parts]
     if not splits or any(num <= 0 for num in splits):
         raise ValueError("拆分规则必须全部为大于 0 的数字")
+
+    if loop:
+        loop_splits = []
+        split_total = 0
+        loop_total = sum(splits)
+        if total % loop_total:
+            remainder = total % loop_total
+            warning = f"拆分规则无法完整循环，最后一轮剩余 {remainder} 页"
+            ui(lambda: messagebox.showwarning("循环未完成", warning))
+            log(
+                f"[WARN]{warning}",
+                "warn",
+            )
+        while split_total < total:
+            for size in splits:
+                loop_splits.append(size)
+                split_total += size
+                if split_total >= total:
+                    break
+        return loop_splits
 
     if len(splits) == 1:
         size = splits[0]
@@ -1980,51 +2003,30 @@ c_tip.config(height=TOP_HEADER_HEIGHT)
 c_tip.pack_propagate(False)
 usage_hint = tk.Label(
     c_tip,
-    text="鼠标停在这里查看使用说明；点击打开开源地址",
+    text="点击查看使用说明",
     bg=CARD,
     fg=MUTED,
     justify="left",
     font=("微软雅黑", 9),
+    cursor="hand2",
 )
 
 usage_hint.pack(anchor="w", padx=14, pady=(0, 10))
 
-open_url = "https://github.com/XinlingLabs/PDF-Tools"
+usage_file_path = resource_path("usage_guide.txt")
 
-usage_hint.bind(
-    "<Button-1>",
-    lambda e: webbrowser.open(open_url)
-)
-usage_tooltip_text = (
-    "使用说明\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "1. 文件\n"
-    "选择或拖入 1 个 PDF：用于拆分。\n"
-    "一次选择多个文件：只执行批量重命名，不拆分。\n"
-    "拖入文件会自动填入第 1 个文件路径。\n\n"
-    "2. 预览拆分\n"
-    "勾选“拖入单文件时预览拆分”后，拖入单个 PDF 自动打开预览。\n"
-    "缩略图按需加载；点击页面可放大，Esc 关闭放大窗口。\n"
-    "勾选左上角复选框作为起止页，按页码两两配对。\n"
-    "例：1、3、6、10 => 1-3、6-10；最后单个勾选页按单页输出。\n"
-    "未落入勾选范围的页面不会输出，点“使用选择”写入规则框。\n\n"
-    "3. 规则拆分\n"
-    "输入 3：每 3 页拆一份，直到 PDF 结束；末段不足会校验提示。\n"
-    "输入 2,3,5 或逐行输入：按 2 页、3 页、5 页依次拆分。\n"
-    "规则总页数少于 PDF 总页数时，剩余页面不会自动输出。\n\n"
-    "4. 命名\n"
-    "新文件名可选，支持逗号或换行；不要写 .pdf 后缀。\n"
-    "只填左侧：按左侧顺序命名；右侧有内容：左1、右1、左2、右2 交替。\n"
-    "名称数量必须等于输出文件数；不能重复；已存在文件不会覆盖。\n"
-    "多文件重命名会保留原扩展名。\n\n"
-    "5. 输出\n"
-    "输出路径为空时使用当前目录；目录不存在会自动创建。\n"
-    "输出目录已有内容时，可选择清空、不清空或取消。\n"
-    "勾选“输出 CSV 校验表”后生成拆分结果.csv。\n"
-    "运行日志会显示生成、校验、错误和耗时。\n\n"
-    "by xinling"
-)
-Tooltip(usage_hint, usage_tooltip_text)
+
+def open_usage_file(event=None):
+    if not os.path.exists(usage_file_path):
+        messagebox.showerror("打开失败", f"未找到使用说明文件：\n{usage_file_path}")
+        return
+    try:
+        os.startfile(usage_file_path)
+    except Exception as exc:
+        messagebox.showerror("打开失败", f"无法打开使用说明文件：\n{exc}")
+
+
+usage_hint.bind("<Button-1>", open_usage_file)
 
 c1 = card("PDF文件")
 e = styled_entry(c1, input_pdf)
@@ -2067,7 +2069,7 @@ tk.Checkbutton(
 c2 = card("拆分规则")
 text_rules = styled_text(c2, 5)
 
-c3 = card("新文件名")
+c3 = card("文件命名")
 text_names_left, text_names_right = styled_name_texts(c3, 5)
 
 bottom_bar = tk.Frame(left, bg="#eef2f7")
