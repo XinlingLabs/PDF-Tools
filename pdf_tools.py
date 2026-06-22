@@ -28,7 +28,7 @@ root.title("PDF Tools")
 root.geometry("1100x900")
 root.minsize(1100, 900)
 root.configure(bg="#eef2f7")
-VERSION = "v3.1.12"
+VERSION = "v3.1.13"
 
 
 def ui(func):
